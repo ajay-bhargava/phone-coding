@@ -10,6 +10,6 @@ volume_size         = 30
 use_spot            = false
 
 # Secrets — set via env vars or paste here (gitignored)
-# ts_authkey   = "tskey-auth-..."
-# amp_api_key  = "..."
-# github_token = "ghp_..."
+# ts_authkey       = "tskey-auth-..."
+# amp_api_key      = "..."
+# github_token = "ghp_..."              # classic PAT (repo + read:org scopes)

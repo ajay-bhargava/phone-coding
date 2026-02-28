@@ -47,7 +47,7 @@ variable "amp_api_key" {
 }
 
 variable "github_token" {
-  description = "GitHub personal access token"
+  description = "GitHub classic PAT (repo + read:org scopes)"
   type        = string
   sensitive   = true
 }
