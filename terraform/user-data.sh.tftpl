@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec > /var/log/user-data.log 2>&1
+
+echo "=== Phone Coding EC2 Bootstrap ==="
+
+# ── 1. System packages ──
+echo ">> System packages..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq tmux jq curl git unzip mosh htop > /dev/null
+
+# ── 2. Tailscale (real TUN — SSH and Mosh work!) ──
+echo ">> Tailscale..."
+curl -fsSL https://tailscale.com/install.sh | sh
+systemctl enable --now tailscaled
+tailscale up --authkey="${ts_authkey}" --ssh --hostname=amp-phone
+
+# ── 3. Amp CLI ──
+echo ">> Amp CLI..."
+sudo -u ubuntu bash -c 'curl -fsSL https://ampcode.com/install.sh | bash'
+sudo -u ubuntu mkdir -p /home/ubuntu/.config/amp
+cat > /home/ubuntu/.config/amp/settings.json << 'EOF'
+{
+  "amp.permissions": [
+    { "tool": "*", "action": "allow" }
+  ]
+}
+EOF
+chown -R ubuntu:ubuntu /home/ubuntu/.config/amp
+
+# ── 4. GitHub CLI ──
+echo ">> GitHub CLI..."
+GH_VER=$(curl -s https://api.github.com/repos/cli/cli/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+curl -fsSL "https://github.com/cli/cli/releases/download/v$${GH_VER}/gh_$${GH_VER}_linux_amd64.tar.gz" \
+  | tar xz -C /tmp
+mv "/tmp/gh_$${GH_VER}_linux_amd64/bin/gh" /usr/local/bin/gh
+rm -rf "/tmp/gh_$${GH_VER}_linux_amd64"
+echo "${github_token}" | sudo -u ubuntu gh auth login --with-token 2>&1 || true
+
+# ── 5. Gum ──
+echo ">> Gum..."
+GUM_VER=$(curl -s https://api.github.com/repos/charmbracelet/gum/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+curl -fsSL "https://github.com/charmbracelet/gum/releases/download/v$${GUM_VER}/gum_$${GUM_VER}_Linux_x86_64.tar.gz" \
+  | tar xz -C /tmp
+mv "/tmp/gum_$${GUM_VER}_Linux_x86_64/gum" /usr/local/bin/gum
+rm -rf "/tmp/gum_$${GUM_VER}_Linux_x86_64"
+
+# ── 6. ttyd (web terminal) ──
+echo ">> ttyd..."
+TTYD_VER=$(curl -s https://api.github.com/repos/tsl0922/ttyd/releases/latest | jq -r '.tag_name')
+curl -fsSL -o /usr/local/bin/ttyd \
+  "https://github.com/tsl0922/ttyd/releases/download/$${TTYD_VER}/ttyd.x86_64"
+chmod +x /usr/local/bin/ttyd
+
+# ttyd systemd service
+cat > /etc/systemd/system/ttyd.service << 'UNIT'
+[Unit]
+Description=ttyd web terminal
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/usr/local/bin/ttyd --writable --port 8080 bash -l
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now ttyd
+
+# ── 7. Shell config for ubuntu user ──
+cat >> /home/ubuntu/.bashrc << 'BASHRC'
+
+# Phone Coding Env
+export AMP_API_KEY='${amp_api_key}'
+export GITHUB_TOKEN='${github_token}'
+export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
+
+alias l='launch'
+alias lst='launch status'
+alias la='launch attach'
+
+# Auto-start tmux on SSH login
+if [ -z "$TMUX" ] && [ -n "$SSH_CONNECTION" ]; then
+  tmux attach -t main 2>/dev/null || tmux new -s main
+fi
+BASHRC
+
+# ── 8. Directories ──
+sudo -u ubuntu mkdir -p /home/ubuntu/{repos,bin,.local/state/phone-coding}
+
+chown -R ubuntu:ubuntu /home/ubuntu
+
+echo ""
+echo "=== Bootstrap complete ==="

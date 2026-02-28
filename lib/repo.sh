@@ -11,6 +11,18 @@ list_repos() {
     -q '[.[] | .nameWithOwner] | .[]'
 }
 
+# List orgs the user belongs to (active memberships only)
+# Uses GH_CLASSIC_TOKEN for read:org scope (fine-grained PATs can't list orgs)
+list_orgs() {
+  if [ -n "$GH_CLASSIC_TOKEN" ]; then
+    GH_TOKEN="$GH_CLASSIC_TOKEN" gh api user/memberships/orgs \
+      --jq '[.[] | select(.state == "active")] | .[].organization.login' 2>/dev/null | sort
+  else
+    gh api user/memberships/orgs \
+      --jq '[.[] | select(.state == "active")] | .[].organization.login' 2>/dev/null | sort
+  fi
+}
+
 # List repos from a specific org
 list_org_repos() {
   local org="$1"

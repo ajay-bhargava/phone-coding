@@ -27,7 +27,8 @@ cmd_new() {
       ;;
     "Org repos")
       local org
-      org=$(gum input --placeholder "GitHub org name")
+      org=$(list_orgs | gum filter --placeholder "Pick an org...")
+      [ -z "$org" ] && die "No org selected"
       repo=$(list_org_repos "$org" | gum filter --placeholder "Search repos...")
       ;;
     "Enter URL manually")
@@ -75,9 +76,16 @@ cmd_new() {
   git -C "$repo_path" checkout -b "$branch" 2>/dev/null || \
     git -C "$repo_path" checkout "$branch" 2>/dev/null || true
 
-  # 5. Record + create tmux session
+  # 5. Record + create tmux session (or reuse existing)
   local session_name
   session_name=$(record_session "$repo" "$mode" "$repo_path" "$branch")
+
+  if tmux has-session -t "$session_name" 2>/dev/null; then
+    gum style --foreground 10 "✓ Reattaching to existing session: $session_name"
+    attach_session "$session_name"
+    return
+  fi
+
   create_amp_session "$session_name" "$repo_path"
 
   # 6. Launch per mode
@@ -87,7 +95,7 @@ cmd_new() {
       gum style --foreground 10 "✓ Amp running in: $session_name"
       gum style --foreground 244 "  Attaching... (Ctrl-B d to detach)"
       sleep 1
-      tmux attach -t "$session_name"
+      attach_session "$session_name"
       ;;
 
     fire-forget)
@@ -136,7 +144,7 @@ cmd_new() {
 
       local attach
       attach=$(gum choose "Attach now" "Leave running in background")
-      [[ "$attach" == "Attach now" ]] && tmux attach -t "$session_name"
+      [[ "$attach" == "Attach now" ]] && attach_session "$session_name"
       ;;
   esac
 }
@@ -180,7 +188,7 @@ cmd_attach() {
 
   local session
   session=$(echo "$sessions" | gum filter --placeholder "Pick session...")
-  [ -n "$session" ] && tmux attach -t "$session"
+  [ -n "$session" ] && attach_session "$session"
 }
 
 cmd_kill() {

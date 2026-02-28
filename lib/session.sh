@@ -13,6 +13,12 @@ record_session() {
   local repo="$1" mode="$2" path="$3" branch="$4"
   local session_name="${TMUX_SESSION_PREFIX}-${repo##*/}"
 
+  # Reuse existing tmux session if it's still alive
+  if tmux has-session -t "$session_name" 2>/dev/null; then
+    echo "$session_name"
+    return
+  fi
+
   local entry
   entry=$(jq -n \
     --arg repo "$repo" \
@@ -85,6 +91,16 @@ create_amp_session() {
   local session_name="$1" repo_path="$2"
   tmux new-session -d -s "$session_name" -c "$repo_path"
   tmux set-option -t "$session_name" mouse on
+}
+
+# Attach or switch to a tmux session (works from inside tmux too)
+attach_session() {
+  local session_name="$1"
+  if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "$session_name"
+  else
+    tmux attach -t "$session_name"
+  fi
 }
 
 launch_amp_interactive() {
