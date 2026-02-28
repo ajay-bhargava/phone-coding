@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+source "$SCRIPT_DIR/lib/config.sh"
+source "$SCRIPT_DIR/lib/repo.sh"
+source "$SCRIPT_DIR/lib/session.sh"
+source "$SCRIPT_DIR/lib/pr.sh"
+
+for cmd in gum gh amp tmux jq git; do
+  require_cmd "$cmd"
+done
+
+# ── Subcommands ──────────────────────────────
+
+cmd_new() {
+  # 1. Pick a repo
+  gum style --bold --foreground 212 "Pick a repository"
+
+  local source
+  source=$(gum choose "My repos" "Org repos" "Enter URL manually")
+
+  local repo
+  case "$source" in
+    "My repos")
+      repo=$(list_repos | gum filter --placeholder "Search repos...")
+      ;;
+    "Org repos")
+      local org
+      org=$(gum input --placeholder "GitHub org name")
+      repo=$(list_org_repos "$org" | gum filter --placeholder "Search repos...")
+      ;;
+    "Enter URL manually")
+      repo=$(gum input --placeholder "owner/repo")
+      repo="${repo#https://github.com/}"
+      repo="${repo%.git}"
+      ;;
+  esac
+
+  [ -z "$repo" ] && die "No repo selected"
+
+  # 2. Clone/pull
+  gum spin --spinner dot --title "Preparing ${repo##*/}..." -- \
+    bash -c "source '$SCRIPT_DIR/lib/repo.sh' && ensure_repo '$repo' >/dev/null"
+
+  local repo_path
+  repo_path=$(ensure_repo "$repo")
+
+  # 3. Pick mode
+  gum style --bold --foreground 212 "How should Amp run?"
+
+  local mode_choice
+  mode_choice=$(gum choose \
+    "🔧 Interactive  (attach to Amp live)" \
+    "🚀 Fire & forget (describe task, detach)" \
+    "📋 Ralph Mode   (PRD-driven autonomous)")
+
+  local mode
+  case "$mode_choice" in
+    *Interactive*) mode="interactive" ;;
+    *Fire*)        mode="fire-forget" ;;
+    *Ralph*)       mode="ralph" ;;
+  esac
+
+  # 4. Branch
+  local branch
+  if [ "$mode" = "interactive" ]; then
+    branch=$(gum input --placeholder "Branch name (empty = current)" --value "")
+    [ -z "$branch" ] && branch=$(git -C "$repo_path" branch --show-current)
+  else
+    local default_branch="amp/${mode}/${repo##*/}-$(date +%m%d)"
+    branch=$(gum input --placeholder "Branch name" --value "$default_branch")
+  fi
+
+  git -C "$repo_path" checkout -b "$branch" 2>/dev/null || \
+    git -C "$repo_path" checkout "$branch" 2>/dev/null || true
+
+  # 5. Record + create tmux session
+  local session_name
+  session_name=$(record_session "$repo" "$mode" "$repo_path" "$branch")
+  create_amp_session "$session_name" "$repo_path"
+
+  # 6. Launch per mode
+  case "$mode" in
+    interactive)
+      launch_amp_interactive "$session_name"
+      gum style --foreground 10 "✓ Amp running in: $session_name"
+      gum style --foreground 244 "  Attaching... (Ctrl-B d to detach)"
+      sleep 1
+      tmux attach -t "$session_name"
+      ;;
+
+    fire-forget)
+      gum style --bold --foreground 212 "What should Amp do?"
+      local task
+      task=$(gum write --placeholder "Describe the task..." --width 80 --height 6)
+      [ -z "$task" ] && die "No task provided"
+
+      local pr_title
+      pr_title=$(gum input --placeholder "PR title" --value "$(echo "$task" | head -1)" --width 80)
+
+      local prompt_file="/tmp/${session_name}-prompt.md"
+      sed \
+        -e "s|{{TASK_DESCRIPTION}}|$task|g" \
+        -e "s|{{REPO_NAME}}|$repo|g" \
+        -e "s|{{REPO_PATH}}|$repo_path|g" \
+        -e "s|{{BRANCH_NAME}}|$branch|g" \
+        -e "s|{{PR_TITLE}}|$pr_title|g" \
+        -e "s|{{SESSION_NAME}}|$session_name|g" \
+        "$SCRIPT_DIR/templates/fire-and-forget.md" > "$prompt_file"
+
+      launch_amp_fire_forget "$session_name" "$prompt_file"
+
+      gum style --foreground 10 "✓ Amp running in background"
+      gum style --foreground 244 "  Session:  $session_name"
+      gum style --foreground 244 "  Status:   launch status"
+      gum style --foreground 244 "  Attach:   launch attach"
+      ;;
+
+    ralph)
+      local pr_title="Ralph Mode: ${repo##*/}"
+
+      local prompt_file="/tmp/${session_name}-prompt.md"
+      sed \
+        -e "s|{{REPO_NAME}}|$repo|g" \
+        -e "s|{{REPO_PATH}}|$repo_path|g" \
+        -e "s|{{BRANCH_NAME}}|$branch|g" \
+        -e "s|{{PR_TITLE}}|$pr_title|g" \
+        -e "s|{{SESSION_NAME}}|$session_name|g" \
+        "$SCRIPT_DIR/templates/ralph-mode.md" > "$prompt_file"
+
+      launch_amp_ralph "$session_name" "$prompt_file"
+
+      gum style --foreground 10 "✓ Ralph Mode launched"
+      gum style --foreground 244 "  Session: $session_name"
+
+      local attach
+      attach=$(gum choose "Attach now" "Leave running in background")
+      [[ "$attach" == "Attach now" ]] && tmux attach -t "$session_name"
+      ;;
+  esac
+}
+
+cmd_status() {
+  gum style --bold --foreground 212 "Active Sessions"
+
+  local table
+  table=$(format_sessions_table)
+
+  if [ "$(echo "$table" | wc -l)" -le 1 ]; then
+    gum style --foreground 244 "No sessions found."
+    return
+  fi
+
+  echo "$table" | gum table --border rounded
+
+  # Check for PRs on finished sessions
+  jq -r '.[] | select(.status == "finished" and .pr == null) | .session' "$SESSIONS_DB" 2>/dev/null | \
+    while read -r session; do
+      local rp
+      rp=$(jq -r --arg s "$session" '.[] | select(.session == $s) | .path' "$SESSIONS_DB")
+      local pr_url
+      pr_url=$(check_pr "$rp" 2>/dev/null | jq -r '.url // empty')
+      if [ -n "$pr_url" ]; then
+        update_session_pr "$session" "$pr_url"
+        update_session_status "$session" "pr-created"
+        gum style --foreground 10 "✓ PR found for $session: $pr_url"
+      fi
+    done
+}
+
+cmd_attach() {
+  local sessions
+  sessions=$(tmux list-sessions -F '#S' 2>/dev/null | grep "^${TMUX_SESSION_PREFIX}-" || true)
+
+  if [ -z "$sessions" ]; then
+    gum style --foreground 244 "No active Amp sessions."
+    return
+  fi
+
+  local session
+  session=$(echo "$sessions" | gum filter --placeholder "Pick session...")
+  [ -n "$session" ] && tmux attach -t "$session"
+}
+
+cmd_kill() {
+  local sessions
+  sessions=$(tmux list-sessions -F '#S' 2>/dev/null | grep "^${TMUX_SESSION_PREFIX}-" || true)
+
+  if [ -z "$sessions" ]; then
+    gum style --foreground 244 "No active sessions."
+    return
+  fi
+
+  local selected
+  selected=$(echo "$sessions" | gum choose --no-limit --header "Select sessions to kill")
+  [ -z "$selected" ] && return
+
+  echo "$selected" | while read -r s; do
+    tmux kill-session -t "$s" 2>/dev/null
+    update_session_status "$s" "killed"
+    gum style --foreground 9 "✗ Killed $s"
+  done
+}
+
+cmd_clean() {
+  init_sessions_db
+  local before after
+  before=$(jq length "$SESSIONS_DB")
+  jq '[.[] | select(.status == "running")]' "$SESSIONS_DB" > "${SESSIONS_DB}.tmp" \
+    && mv "${SESSIONS_DB}.tmp" "$SESSIONS_DB"
+  after=$(jq length "$SESSIONS_DB")
+  gum style --foreground 10 "Cleaned $((before - after)) finished sessions"
+}
+
+show_help() {
+  gum style --bold --foreground 212 --border rounded --padding "1 2" \
+    "launch — Remote Amp Execution Manager" \
+    "" \
+    "Commands:" \
+    "  (default)  Pick a repo and start Amp" \
+    "  status     Show all sessions" \
+    "  attach     Attach to a running session" \
+    "  kill       Kill running sessions" \
+    "  clean      Remove finished sessions from DB" \
+    "  help       Show this help"
+}
+
+# ── Dispatch ─────────────────────────────────
+
+case "${1:-}" in
+  status)         cmd_status ;;
+  attach)         cmd_attach ;;
+  kill)           cmd_kill ;;
+  clean)          cmd_clean ;;
+  help|-h|--help) show_help ;;
+  ""|new)         cmd_new ;;
+  *)              die "Unknown command: $1. Run 'launch help'." ;;
+esac
